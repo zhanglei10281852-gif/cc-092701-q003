@@ -42,6 +42,12 @@ class ComputeRepository:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks WHERE requested_by=? GROUP BY status", (requested_by,)).fetchall()
         return {str(row["status"]): int(row["amount"]) for row in rows}
 
+    def count_running(self, requested_by: str) -> int:
+        return int(self.connection.execute(
+            "SELECT COUNT(*) FROM compute_tasks WHERE requested_by=? AND status='running'",
+            (requested_by,),
+        ).fetchone()[0])
+
     def count_user_submissions_since(self, requested_by: str, since: str) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM compute_tasks WHERE requested_by=? AND created_at>=?", (requested_by, since)).fetchone()[0])
 
@@ -58,7 +64,12 @@ class ComputeRepository:
         )
         return dict(self.task_by_id(cursor.lastrowid))
 
-    def queued_candidate(self, capabilities: Iterable[str], now: str) -> sqlite3.Row | None:
+    def queued_candidates(self, capabilities: Iterable[str], now: str, limit: int = 200) -> list[sqlite3.Row]:
+        """返回可领取的排队任务。
+
+        按学员轮询（requested_by 组内时间最久的任务先出，再按组优先级），
+        保证队首学员的运行名额已满时，后面学员的任务仍能被领取，队列不会被阻塞。
+        """
         capability_list = sorted(set(capabilities))
         params: list[Any] = [now]
         condition = ""
@@ -66,10 +77,26 @@ class ComputeRepository:
             placeholders = ",".join("?" for _ in capability_list)
             condition = f" AND tpl.algorithm IN ({placeholders})"
             params.extend(capability_list)
-        return self.connection.execute(
-            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
+        params.append(limit)
+        rows = self.connection.execute(
+            """
+            SELECT t.*, tpl.algorithm AS template_algorithm,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY t.requested_by
+                       ORDER BY t.priority DESC, t.created_at ASC, t.id ASC
+                   ) AS user_turn
+              FROM compute_tasks t
+              JOIN compute_templates tpl ON tpl.id = t.template_id
+             WHERE t.status='queued' AND t.available_at<=?
+            """
+            + condition
+            + """
+             ORDER BY user_turn ASC, t.priority DESC, t.created_at ASC, t.id ASC
+             LIMIT ?
+            """,
             params,
-        ).fetchone()
+        ).fetchall()
+        return list(rows)
 
     def result_versions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_results WHERE task_id=? ORDER BY version", (task_id,)).fetchall()]

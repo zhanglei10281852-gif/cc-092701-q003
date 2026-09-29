@@ -88,16 +88,19 @@ class ComputeOperationsService:
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
-            if candidate is None:
-                return None
-            cursor = connection.execute(
-                "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (worker_id, lease_until, now, now, candidate["id"]),
-            )
-            if cursor.rowcount != 1:
-                return None
-            return dict(repository.task_by_id(candidate["id"]))
+            candidates = repository.queued_candidates(capabilities, now)
+            for candidate in candidates:
+                quota = repository.quota("user", candidate["requested_by"])
+                if quota is not None and repository.count_running(candidate["requested_by"]) >= int(quota["max_running"]):
+                    # 该学员运行名额已满：跳过其队首任务，继续尝试其他学员，避免队首阻塞。
+                    continue
+                cursor = connection.execute(
+                    "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
+                    (worker_id, lease_until, now, now, candidate["id"]),
+                )
+                if cursor.rowcount == 1:
+                    return dict(repository.task_by_id(candidate["id"]))
+            return None
 
     def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
@@ -149,6 +152,22 @@ class ComputeOperationsService:
             connection.execute(
                 "UPDATE compute_tasks SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (status, available, error_code, message[:2000], None if can_retry else now, now, task_id),
+            )
+            return dict(repository.task_by_id(task_id))
+
+    def acknowledge_cancel(self, task_id: int, worker_id: str) -> dict[str, Any]:
+        """工作者确认已停止运行中的任务，立即释放运行名额。"""
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            task = repository.task_by_id(task_id)
+            if task is None:
+                raise NotFoundError("计算任务不存在")
+            if task["status"] != "cancel_requested" or task["lease_owner"] != worker_id:
+                raise ConflictError("任务未等待取消确认，或未由当前工作者持有")
+            connection.execute(
+                "UPDATE compute_tasks SET status='cancelled',lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                (now, now, task_id),
             )
             return dict(repository.task_by_id(task_id))
 
@@ -242,8 +261,8 @@ class ComputeOperationsService:
         states = repository.count_user_states(requested_by)
         if states.get("queued", 0) >= int(quota["max_queued"]):
             raise ConflictError("用户排队任务配额已用尽")
-        if states.get("running", 0) >= int(quota["max_running"]):
-            raise ConflictError("用户运行任务配额已用尽")
+        # 运行名额（max_running）在领取的原子边界内重新核对，提交时不拦截，
+        # 因此学员在名额占满时仍可排队，待其他任务释放名额后再被领取。
         day_start = to_storage(now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0))
         if repository.count_user_submissions_since(requested_by, day_start) >= int(quota["daily_submissions"]):
             raise ConflictError("用户当日提交配额已用尽")

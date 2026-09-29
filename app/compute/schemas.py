@@ -56,6 +56,10 @@ class CancelRequest(BaseModel):
     reason: str = Field(min_length=2, max_length=1000)
 
 
+class CancelAcknowledge(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=120)
+
+
 class RetryRequest(BaseModel):
     actor: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=2, max_length=1000)
