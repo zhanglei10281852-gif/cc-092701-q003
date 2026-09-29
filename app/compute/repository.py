@@ -58,7 +58,13 @@ class ComputeRepository:
         )
         return dict(self.task_by_id(cursor.lastrowid))
 
-    def queued_candidate(self, capabilities: Iterable[str], now: str) -> sqlite3.Row | None:
+    def next_claimable(self, capabilities: Iterable[str], now: str) -> sqlite3.Row | None:
+        """按队列顺序返回第一个可领取任务。
+
+        在同一条查询内重新核对每名学员的运行上限：队首任务所属学员一旦
+        已经达到 max_running，就跳过该账号继续考察后续任务，使满员账号
+        不会阻塞其他学员。没有配置配额的学员视为不限并行数。
+        """
         capability_list = sorted(set(capabilities))
         params: list[Any] = [now]
         condition = ""
@@ -67,7 +73,15 @@ class ComputeRepository:
             condition = f" AND tpl.algorithm IN ({placeholders})"
             params.extend(capability_list)
         return self.connection.execute(
-            "SELECT t.*,tpl.algorithm AS template_algorithm FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
+            "SELECT * FROM ("
+            "SELECT t.*,tpl.algorithm AS template_algorithm,"
+            "(SELECT COUNT(*) FROM compute_tasks r WHERE r.requested_by=t.requested_by AND r.status='running') AS running_count,"
+            "q.max_running AS quota_max_running "
+            "FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id "
+            "LEFT JOIN compute_quotas q ON q.subject_type='user' AND q.subject_key=t.requested_by "
+            "WHERE t.status='queued' AND t.available_at<=?" + condition +
+            ") WHERE quota_max_running IS NULL OR running_count<quota_max_running "
+            "ORDER BY priority DESC,created_at ASC,id ASC LIMIT 1",
             params,
         ).fetchone()
 

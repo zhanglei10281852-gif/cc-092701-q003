@@ -88,7 +88,11 @@ class ComputeOperationsService:
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
+            # 先在同一事务内回收过期租约：名额随状态恢复立即回到池中，
+            # 随后的候选查询看到的就是最新占用情况。
+            self._reclaim_expired_leases(connection, now)
+            # 在同一事务内重新核对每名学员的并行上限，满员账号直接跳过。
+            candidate = repository.next_claimable(capabilities, now)
             if candidate is None:
                 return None
             cursor = connection.execute(
@@ -189,25 +193,8 @@ class ComputeOperationsService:
 
     def recover_expired(self, actor: str = "recovery-worker") -> dict[str, Any]:
         now = to_storage(self.clock.now())
-        recovered: list[int] = []
-        exhausted: list[int] = []
         with transaction(immediate=True) as connection:
-            repository = ComputeRepository(connection)
-            rows = connection.execute("SELECT * FROM compute_tasks WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
-            for task in rows:
-                before = dict(task)
-                if int(task["attempt_count"]) < int(task["max_attempts"]):
-                    status, finished_at = "queued", None
-                    recovered.append(int(task["id"]))
-                else:
-                    status, finished_at = "failed", now
-                    exhausted.append(int(task["id"]))
-                connection.execute(
-                    "UPDATE compute_tasks SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='工作者租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                    (status, now, finished_at, now, task["id"]),
-                )
-                after = dict(repository.task_by_id(task["id"]))
-                repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
+            recovered, exhausted = self._reclaim_expired_leases(connection, now, actor)
         return {"recovered": recovered, "exhausted": exhausted}
 
     def summary(self) -> dict[str, Any]:
@@ -229,6 +216,38 @@ class ComputeOperationsService:
             return after
 
     @staticmethod
+    def _reclaim_expired_leases(connection: sqlite3.Connection, now: str, actor: str | None = None) -> tuple[list[int], list[int]]:
+        """回收已过期租约：未满重试次数的任务回到队列，其余判定失败。
+
+        无论走哪条路径，任务都立即离开 running，占用的并行名额随之释放。
+        领取事务调用时 actor 为 None，只做状态回收、不写人工干预记录；
+        运维恢复调用时照常登记 lease_recovery 干预。
+        """
+        repository = ComputeRepository(connection)
+        recovered: list[int] = []
+        exhausted: list[int] = []
+        rows = connection.execute(
+            "SELECT * FROM compute_tasks WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id",
+            (now,),
+        ).fetchall()
+        for task in rows:
+            before = dict(task)
+            if int(task["attempt_count"]) < int(task["max_attempts"]):
+                status, finished_at = "queued", None
+                recovered.append(int(task["id"]))
+            else:
+                status, finished_at = "failed", now
+                exhausted.append(int(task["id"]))
+            connection.execute(
+                "UPDATE compute_tasks SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='工作者租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                (status, now, finished_at, now, task["id"]),
+            )
+            if actor is not None:
+                after = dict(repository.task_by_id(task["id"]))
+                repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
+        return recovered, exhausted
+
+    @staticmethod
     def _cancel_mutation(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
         if task["status"] not in {"queued", "running"}:
             raise ConflictError("当前任务状态不允许取消")
@@ -240,10 +259,10 @@ class ComputeOperationsService:
         if quota is None:
             return
         states = repository.count_user_states(requested_by)
+        # 排队与当日提交量在入队时把关；并行运行上限不在此校验，
+        # 统一在领取的原子边界重新核对，避免排队记录绕过规则进入运行。
         if states.get("queued", 0) >= int(quota["max_queued"]):
             raise ConflictError("用户排队任务配额已用尽")
-        if states.get("running", 0) >= int(quota["max_running"]):
-            raise ConflictError("用户运行任务配额已用尽")
         day_start = to_storage(now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0))
         if repository.count_user_submissions_since(requested_by, day_start) >= int(quota["daily_submissions"]):
             raise ConflictError("用户当日提交配额已用尽")
